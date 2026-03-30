@@ -1049,41 +1049,11 @@ Status Attention<T>::RunUnfusedAttention(
   cublasHandle_t cublas = GetCublasHandle(context);
   cudnnHandle_t cudnn = GetCudnnHandle(context);
 
-  {
-    auto qkv_status = onnxruntime::contrib::cuda::QkvToContext<CudaT, CudaT>(
-        device_prop, cublas, cudnn, context->GetComputeStream(), contribop_parameters, data);
-    ORT_RETURN_IF_ERROR(qkv_status);
-  }
-
-  // Post-QkvToContext: zero output for fully-masked batches (nonpad_kv_seqlen path only).
-  // When nonpad_kv_seqlen=0, all positions receive mask_filter_value bias (finite).
-  // Unfused softmax (with max-subtraction) produces uniform weights, not NaN.
-  // Zero out to match Flash behavior (which returns zeros for fully-masked batches).
-  // Note: the bool mask + past_key decode path does NOT need this — its additive bias
-  // produces uniform (non-zero but valid) softmax weights, not NaN.
-
-  // Zero out output for batches where nonpad_kv_seqlen == 0 (all KV positions masked).
-  if (nonpad_kv_seqlen != nullptr) {
-    auto seqlens_k_buffer = GetScratchBuffer<int>(parameters.batch_size, context->GetComputeStream());
-    ORT_RETURN_IF_ERROR(LaunchConvertNonpadKvSeqlenToFlashSeqlensK(
-        nonpad_kv_seqlen->Data<int64_t>(),
-        seqlens_k_buffer.get(),
-        parameters.batch_size,
-        parameters.total_sequence_length,
-        cuda_stream,
-        device_prop.maxThreadsPerBlock));
-
-    int elements_per_batch = parameters.q_sequence_length * parameters.q_num_heads * parameters.v_head_size;
-    ORT_RETURN_IF_ERROR(LaunchZeroOutputForFullyMaskedBatches<NativeCudaT>(
-        reinterpret_cast<NativeCudaT*>(Y->MutableData<T>()),
-        seqlens_k_buffer.get(),
-        parameters.batch_size,
-        elements_per_batch,
-        cuda_stream,
-        device_prop.maxThreadsPerBlock));
-  }
-
-  return Status::OK();
+  // Note: unfused attention produces valid finite output (mean-of-V via uniform softmax)
+  // for fully-masked batches, so ZeroOutput is not needed here. Only MEA requires
+  // ZeroOutput to prevent NaN from the CUTLASS epilogue's 1/s_prime division.
+  return onnxruntime::contrib::cuda::QkvToContext<CudaT, CudaT>(
+      device_prop, cublas, cudnn, context->GetComputeStream(), contribop_parameters, data);
 }
 
 // ============================================================================
