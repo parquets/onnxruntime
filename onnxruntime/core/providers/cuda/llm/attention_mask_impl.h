@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #pragma once
+#include <climits>
 #include "core/providers/cuda/shared_inc/cuda_utils.h"
 #include "core/common/status.h"
 
@@ -45,7 +46,8 @@ Status LaunchConvertMaskToFlashSeqlensK(
     int64_t mask_dim2,
     cudaStream_t stream,
     int max_threads_per_block,
-    int seqlen_offset = 0);
+    int seqlen_offset = 0,
+    int max_seqlen = INT_MAX);
 
 // Convert a boolean attention mask to an additive attention bias for the MHA path.
 // Maps true -> 0.0 (attend) and false -> mask_filter_value (mask out).
@@ -99,11 +101,10 @@ Status LaunchAddBiasInPlace(
     int max_threads_per_block);
 
 // Zero output elements for batches where seqlens_k == 0 (fully masked).
-// CUTLASS MEA epilogue computes 1/s_prime where s_prime=0 → NaN for fully-masked
-// batches. The unfused path produces uniform softmax weights (finite mask_filter_value,
-// not -inf) so output is valid but non-zero; we still zero for Flash parity.
-// Flash handles this natively with an early-exit.
-// Used in both MEA and unfused nonpad_kv_seqlen paths.
+// Used in the MEA path only: CUTLASS epilogue computes 1/s_prime where s_prime=0,
+// producing NaN for fully-masked batches. This kernel overwrites those NaN outputs
+// with zeros. The unfused path produces valid finite output (mean-of-V via uniform
+// softmax) and does not need this. Flash handles it natively with an early-exit.
 template <typename T>
 Status LaunchZeroOutputForFullyMaskedBatches(
     T* output,

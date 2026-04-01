@@ -19,6 +19,19 @@ using namespace onnxruntime::cuda;
 namespace onnxruntime {
 namespace cuda {
 
+namespace llm_attention_detail {
+
+template <typename NodeType>
+bool HasOutput(const NodeType& node, size_t output_index) {
+  if constexpr (requires(const NodeType& candidate) { candidate.OutputCount(); candidate.OutputExists(output_index); }) {
+    return node.OutputCount() > output_index && node.OutputExists(output_index);
+  } else {
+    return node.OutputDefs().size() > output_index && node.OutputDefs()[output_index]->Exists();
+  }
+}
+
+}  // namespace llm_attention_detail
+
 #define REGISTER_KERNEL_TYPED(T)                                      \
   ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(                            \
       Attention,                                                      \
@@ -60,7 +73,8 @@ Attention<T>::Attention(const OpKernelInfo& info) : CudaKernel(info) {
   kv_num_heads_ = static_cast<int>(info.GetAttrOrDefault<int64_t>("kv_num_heads", 0));
   q_num_heads_ = static_cast<int>(info.GetAttrOrDefault<int64_t>("q_num_heads", 0));
   int mode = static_cast<int>(info.GetAttrOrDefault<int64_t>("qk_matmul_output_mode", 0));
-  qk_matmul_output_mode_ = info.node().OutputDefs().size() >= 4 && info.node().OutputDefs()[3]->Exists()
+  const auto& node = info.node();
+  qk_matmul_output_mode_ = llm_attention_detail::HasOutput(node, 3)
                                ? static_cast<attention_helper::QKMatMulOutputMode>(mode)
                                : attention_helper::QKMatMulOutputMode::kNone;
   ORT_ENFORCE(qk_matmul_output_mode_ == attention_helper::QKMatMulOutputMode::kNone ||
@@ -138,7 +152,7 @@ Status Attention<T>::ConvertAttnMaskToBias(
     using NativeCudaT = typename onnxruntime::cuda::OrtToCudaType<T>::type;
     int64_t num_elements = attn_mask->Shape().Size();
     converted_mask_buffer = GetScratchBuffer<void>(
-        num_elements * sizeof(NativeCudaT), context->GetComputeStream());
+        num_elements * sizeof(NativeCudaT), GetComputeStream(context));
     float mask_filter_value = static_cast<float>(std::numeric_limits<T>::lowest());
     ORT_RETURN_IF_ERROR(LaunchConvertBoolMaskToAttentionBias<NativeCudaT>(
         attn_mask->Data<bool>(),
@@ -219,7 +233,7 @@ Status Attention<T>::RunFlashAttention(
     const attention_helper::AttentionParameters& parameters) const {
 #if USE_FLASH_ATTENTION
   auto& device_prop = GetDeviceProp();
-  auto cuda_stream = static_cast<cudaStream_t>(context->GetComputeStream()->GetHandle());
+  auto cuda_stream = Stream(context);
   const bool is_bf16 = std::is_same<T, BFloat16>::value;
   const bool is_bsnh = parameters.transpose_output;  // 3D inputs → BSNH
 
@@ -233,9 +247,9 @@ Status Attention<T>::RunFlashAttention(
           parameters.total_sequence_length, parameters.q_num_heads,
           parameters.head_size, device_prop.multiProcessorCount);
 
-  auto softmax_lse_buffer = GetScratchBuffer<void>(softmax_lse_bytes, context->GetComputeStream());
-  auto softmax_lse_accum_buffer = GetScratchBuffer<void>(softmax_lse_accum_bytes, context->GetComputeStream());
-  auto out_accum_buffer = GetScratchBuffer<void>(out_accum_bytes, context->GetComputeStream());
+  auto softmax_lse_buffer = GetScratchBuffer<void>(softmax_lse_bytes, GetComputeStream(context));
+  auto softmax_lse_accum_buffer = GetScratchBuffer<void>(softmax_lse_accum_bytes, GetComputeStream(context));
+  auto out_accum_buffer = GetScratchBuffer<void>(out_accum_bytes, GetComputeStream(context));
 
   if (softmax_lse_accum_bytes > 0) {
     CUDA_RETURN_IF_ERROR(cudaMemsetAsync(softmax_lse_accum_buffer.get(), 0,
@@ -252,7 +266,7 @@ Status Attention<T>::RunFlashAttention(
   if (!is_bsnh) {
     size_t q_bytes = sizeof(T) * parameters.batch_size * parameters.q_sequence_length *
                      parameters.q_num_heads * parameters.head_size;
-    q_bsnh_buffer = GetScratchBuffer<void>(q_bytes, context->GetComputeStream());
+    q_bsnh_buffer = GetScratchBuffer<void>(q_bytes, GetComputeStream(context));
     ORT_RETURN_IF_ERROR(TransposeBNSHtoBSNH<T>(
         parameters.batch_size, parameters.q_sequence_length,
         parameters.q_num_heads, parameters.head_size,
@@ -267,7 +281,7 @@ Status Attention<T>::RunFlashAttention(
   if (!is_bsnh) {
     size_t out_bytes = sizeof(T) * parameters.batch_size * parameters.q_sequence_length *
                        parameters.q_num_heads * parameters.v_head_size;
-    out_bsnh_buffer = GetScratchBuffer<void>(out_bytes, context->GetComputeStream());
+    out_bsnh_buffer = GetScratchBuffer<void>(out_bytes, GetComputeStream(context));
     out_data = out_bsnh_buffer.get();
   }
 
@@ -280,7 +294,7 @@ Status Attention<T>::RunFlashAttention(
                 "(past_sequence_length must be 0, got ",
                 parameters.past_sequence_length, ").");
 
-    auto seqlens_k_buffer = GetScratchBuffer<int>(parameters.batch_size, context->GetComputeStream());
+    auto seqlens_k_buffer = GetScratchBuffer<int>(parameters.batch_size, GetComputeStream(context));
     ORT_RETURN_IF_ERROR(LaunchConvertNonpadKvSeqlenToFlashSeqlensK(
         nonpad_kv_seqlen->Data<int64_t>(),
         seqlens_k_buffer.get(),
@@ -334,20 +348,23 @@ Status Attention<T>::RunFlashAttention(
 
     // Step 1: Compute per-batch past sequence lengths for the concat kernel.
     // The concat kernel needs past_seq_lens to know where past data ends and new begins.
-    auto past_seqlens_buffer = GetScratchBuffer<int>(parameters.batch_size, context->GetComputeStream());
+    auto past_seqlens_buffer = GetScratchBuffer<int>(parameters.batch_size, GetComputeStream(context));
     if (attn_mask != nullptr && attn_mask->IsDataType<bool>()) {
       size_t mask_dims = attn_mask->Shape().NumDimensions();
       auto dims = attn_mask->Shape().GetDims();
       int64_t mask_dim0 = dims[0];
       int64_t mask_dim1 = mask_dims >= 3 ? dims[1] : 0;
       int64_t mask_dim2 = mask_dims >= 4 ? dims[2] : 0;
-      // Offset -kv_seq: mask encodes total valid count; subtract to get past-only count.
-      int seqlen_offset = -parameters.kv_sequence_length;
+      // Compute past_seqlens = min(leading_trues, past_sequence_length).
+      // This correctly handles partial masks where trailing False masks the new token:
+      //   [T,T,T,T] past=3 → min(4,3)=3 ✅  [T,T,T,F] past=3 → min(3,3)=3 ✅
+      //   [F,F,F,F] past=3 → min(0,3)=0 ✅
       ORT_RETURN_IF_ERROR(LaunchConvertMaskToFlashSeqlensK(
           attn_mask->Data<bool>(), past_seqlens_buffer.get(),
           parameters.batch_size, parameters.total_sequence_length,
           static_cast<int>(mask_dims), mask_dim0, mask_dim1, mask_dim2,
-          cuda_stream, device_prop.maxThreadsPerBlock, seqlen_offset));
+          cuda_stream, device_prop.maxThreadsPerBlock,
+          /*seqlen_offset=*/0, /*max_seqlen=*/parameters.past_sequence_length));
     } else {
       ORT_RETURN_IF_ERROR(LaunchFillInt32(past_seqlens_buffer.get(), parameters.past_sequence_length,
                                           parameters.batch_size, cuda_stream,
@@ -364,8 +381,8 @@ Status Attention<T>::RunFlashAttention(
                        parameters.kv_num_heads * parameters.head_size;
       size_t v_bytes = sizeof(T) * parameters.batch_size * parameters.kv_sequence_length *
                        parameters.kv_num_heads * parameters.v_head_size;
-      k_bsnh_buffer = GetScratchBuffer<void>(k_bytes, context->GetComputeStream());
-      v_bsnh_buffer = GetScratchBuffer<void>(v_bytes, context->GetComputeStream());
+      k_bsnh_buffer = GetScratchBuffer<void>(k_bytes, GetComputeStream(context));
+      v_bsnh_buffer = GetScratchBuffer<void>(v_bytes, GetComputeStream(context));
       ORT_RETURN_IF_ERROR(TransposeBNSHtoBSNH<T>(
           parameters.batch_size, parameters.kv_sequence_length,
           parameters.kv_num_heads, parameters.head_size,
@@ -413,7 +430,7 @@ Status Attention<T>::RunFlashAttention(
     // Step 4: Compute total seqlens for mha_fwd_kvcache.
     // With k_new=nullptr, the kernel treats seqlens_k as the total valid token count
     // (not pre-append count), so we need past + new.
-    auto seqlens_k_buffer = GetScratchBuffer<int>(parameters.batch_size, context->GetComputeStream());
+    auto seqlens_k_buffer = GetScratchBuffer<int>(parameters.batch_size, GetComputeStream(context));
     if (attn_mask != nullptr && attn_mask->IsDataType<bool>()) {
       size_t mask_dims = attn_mask->Shape().NumDimensions();
       auto dims = attn_mask->Shape().GetDims();
@@ -567,7 +584,7 @@ Status Attention<T>::RunMemoryEfficientAttention(
   ORT_UNUSED_PARAMETER(past_key);
   ORT_UNUSED_PARAMETER(past_value);
   auto& device_prop = GetDeviceProp();
-  auto cuda_stream = static_cast<cudaStream_t>(context->GetComputeStream()->GetHandle());
+  auto cuda_stream = Stream(context);
   const bool is_bsnh = parameters.transpose_output;
   const int sm = device_prop.major * 10 + device_prop.minor;
 
@@ -581,7 +598,7 @@ Status Attention<T>::RunMemoryEfficientAttention(
   if (!is_bsnh) {
     size_t q_bytes = sizeof(T) * parameters.batch_size * parameters.q_sequence_length *
                      parameters.q_num_heads * parameters.head_size;
-    q_bsnh_buffer = GetScratchBuffer<void>(q_bytes, context->GetComputeStream());
+    q_bsnh_buffer = GetScratchBuffer<void>(q_bytes, GetComputeStream(context));
     ORT_RETURN_IF_ERROR(TransposeBNSHtoBSNH<T>(
         parameters.batch_size, parameters.q_sequence_length,
         parameters.q_num_heads, parameters.head_size,
@@ -596,7 +613,7 @@ Status Attention<T>::RunMemoryEfficientAttention(
   if (!is_bsnh) {
     size_t out_bytes = sizeof(T) * parameters.batch_size * parameters.q_sequence_length *
                        parameters.q_num_heads * parameters.v_head_size;
-    out_bsnh_buffer = GetScratchBuffer<void>(out_bytes, context->GetComputeStream());
+    out_bsnh_buffer = GetScratchBuffer<void>(out_bytes, GetComputeStream(context));
     out_data = out_bsnh_buffer.get();
   }
 
@@ -622,8 +639,8 @@ Status Attention<T>::RunMemoryEfficientAttention(
                                           static_cast<size_t>(parameters.total_sequence_length) *
                                           static_cast<size_t>(parameters.q_num_heads) *
                                           static_cast<size_t>(parameters.head_size);
-      k_expand_buffer = GetScratchBuffer<void>(expanded_kv_elements * sizeof(T), context->GetComputeStream());
-      v_expand_buffer = GetScratchBuffer<void>(expanded_kv_elements * sizeof(T), context->GetComputeStream());
+      k_expand_buffer = GetScratchBuffer<void>(expanded_kv_elements * sizeof(T), GetComputeStream(context));
+      v_expand_buffer = GetScratchBuffer<void>(expanded_kv_elements * sizeof(T), GetComputeStream(context));
 
       onnxruntime::contrib::GroupQueryAttentionParameters ungroup_params = {};
       ungroup_params.batch_size = parameters.batch_size;
@@ -661,7 +678,7 @@ Status Attention<T>::RunMemoryEfficientAttention(
   if (nonpad_kv_seqlen != nullptr) {
     // Convert nonpad_kv_seqlen to seqlens_k for custom right padding.
     // MEA expects actual token count (not count-1), so use FlashSeqlensK variant.
-    auto seqlens_k_buffer = GetScratchBuffer<int>(parameters.batch_size, context->GetComputeStream());
+    auto seqlens_k_buffer = GetScratchBuffer<int>(parameters.batch_size, GetComputeStream(context));
     ORT_RETURN_IF_ERROR(LaunchConvertNonpadKvSeqlenToFlashSeqlensK(
         nonpad_kv_seqlen->Data<int64_t>(),
         seqlens_k_buffer.get(),
@@ -710,7 +727,7 @@ Status Attention<T>::RunMemoryEfficientAttention(
             parameters.v_head_size, sizeof(T) == sizeof(float))) {
       size_t workspace_bytes = sizeof(float) * parameters.batch_size * parameters.q_sequence_length *
                                parameters.q_num_heads * parameters.v_head_size;
-      workspace_buffer = GetScratchBuffer<void>(workspace_bytes, context->GetComputeStream());
+      workspace_buffer = GetScratchBuffer<void>(workspace_bytes, GetComputeStream(context));
       p.workspace = workspace_buffer.get();
     } else {
       p.workspace = nullptr;
@@ -773,7 +790,7 @@ Status Attention<T>::RunMemoryEfficientAttention(
             parameters.v_head_size, sizeof(T) == sizeof(float))) {
       size_t workspace_bytes = sizeof(float) * parameters.batch_size * parameters.q_sequence_length *
                                parameters.q_num_heads * parameters.v_head_size;
-      workspace_buffer = GetScratchBuffer<void>(workspace_bytes, context->GetComputeStream());
+      workspace_buffer = GetScratchBuffer<void>(workspace_bytes, GetComputeStream(context));
       p.workspace = workspace_buffer.get();
     } else {
       p.workspace = nullptr;
@@ -862,7 +879,8 @@ Status Attention<T>::RunUnfusedAttention(
   // OrtToCudaType maps BFloat16 → __nv_bfloat16 (native HW type), matching kernel instantiations.
   using NativeCudaT = typename onnxruntime::cuda::OrtToCudaType<T>::type;
   auto& device_prop = GetDeviceProp();
-  auto cuda_stream = static_cast<cudaStream_t>(context->GetComputeStream()->GetHandle());
+  auto cuda_stream = Stream(context);
+  auto ort_stream = GetOrtStream(context);
 
   // Bridge to contrib::AttentionParameters for the MHA unfused path
   onnxruntime::contrib::AttentionParameters contribop_parameters;
@@ -943,7 +961,7 @@ Status Attention<T>::RunUnfusedAttention(
     int64_t bias_elements = static_cast<int64_t>(parameters.batch_size) *
                             parameters.q_sequence_length *
                             parameters.total_sequence_length;
-    converted_mask_buffer = GetScratchBuffer<void>(bias_elements * sizeof(NativeCudaT), context->GetComputeStream());
+    converted_mask_buffer = GetScratchBuffer<void>(bias_elements * sizeof(NativeCudaT), GetComputeStream(context));
     ORT_RETURN_IF_ERROR(LaunchConvertNonpadKvSeqlenToAttentionBias<NativeCudaT>(
         nonpad_kv_seqlen->Data<int64_t>(),
         reinterpret_cast<NativeCudaT*>(converted_mask_buffer.get()),
@@ -973,7 +991,7 @@ Status Attention<T>::RunUnfusedAttention(
 
       if (attn_mask->IsDataType<bool>()) {
         // Convert bool mask to additive bias in a temp buffer, then add in-place.
-        mask_bias_buffer = GetScratchBuffer<void>(mask_elements * sizeof(NativeCudaT), context->GetComputeStream());
+        mask_bias_buffer = GetScratchBuffer<void>(mask_elements * sizeof(NativeCudaT), GetComputeStream(context));
         ORT_RETURN_IF_ERROR(LaunchConvertBoolMaskToAttentionBias<NativeCudaT>(
             attn_mask->Data<bool>(),
             reinterpret_cast<NativeCudaT*>(mask_bias_buffer.get()),
@@ -1006,7 +1024,7 @@ Status Attention<T>::RunUnfusedAttention(
   } else if (attn_mask != nullptr) {
     if (attn_mask->IsDataType<bool>()) {
       int64_t num_elements = attn_mask->Shape().Size();
-      converted_mask_buffer = GetScratchBuffer<void>(num_elements * sizeof(NativeCudaT), context->GetComputeStream());
+      converted_mask_buffer = GetScratchBuffer<void>(num_elements * sizeof(NativeCudaT), GetComputeStream(context));
       ORT_RETURN_IF_ERROR(LaunchConvertBoolMaskToAttentionBias<NativeCudaT>(
           attn_mask->Data<bool>(),
           reinterpret_cast<NativeCudaT*>(converted_mask_buffer.get()),
@@ -1040,7 +1058,7 @@ Status Attention<T>::RunUnfusedAttention(
       contribop_parameters.total_sequence_length,
       nullptr, false, false, false, false, false,
       no_qkv_workspace);
-  auto work_space = GetScratchBuffer<void>(workspace_bytes, context->GetComputeStream());
+  auto work_space = GetScratchBuffer<void>(workspace_bytes, GetComputeStream(context));
 
   data.has_qkv_workspace = !no_qkv_workspace;
   data.workspace = reinterpret_cast<CudaT*>(work_space.get());
@@ -1053,7 +1071,7 @@ Status Attention<T>::RunUnfusedAttention(
   // for fully-masked batches, so ZeroOutput is not needed here. Only MEA requires
   // ZeroOutput to prevent NaN from the CUTLASS epilogue's 1/s_prime division.
   return onnxruntime::contrib::cuda::QkvToContext<CudaT, CudaT>(
-      device_prop, cublas, cudnn, context->GetComputeStream(), contribop_parameters, data);
+      device_prop, cublas, cudnn, ort_stream.get(), contribop_parameters, data);
 }
 
 // ============================================================================
@@ -1149,10 +1167,10 @@ Status Attention<T>::ComputeInternal(OpKernelContext* context) const {
         // in mha_fwd/mha_fwd_kvcache when seqlens_k is used). Route to MEA instead.
         !(nonpad_kv_seqlen != nullptr && attn_mask != nullptr);
 
-    // TODO(titaiwang): Flash interprets bool attn_mask as a padding mask (via seqlens_k),
-    // which produces different results from the ONNX spec's element-wise mask interpretation
-    // when used with past_key. Need to either reject attn_mask+past_key in Flash,
-    // or reconcile the semantic difference.
+    // Flash interprets bool attn_mask as a padding mask via seqlens_k (leading-True count).
+    // ConvertMaskToSeqlensKernel computes past_seqlens = min(leading_trues, past_sequence_length)
+    // and seqlens_k = leading_trues, which correctly handles contiguous right-padded masks.
+    // Non-contiguous masks (e.g. [T,F,T]) are rejected by the kernel (CUDA_KERNEL_ASSERT).
     if (flash_eligible) {
       return RunFlashAttention(context, Q, K, V, attn_mask, past_key, past_value,
                                nonpad_kv_seqlen, Y, present_key, present_value, parameters);
@@ -1178,12 +1196,11 @@ Status Attention<T>::ComputeInternal(OpKernelContext* context) const {
     // total_sequence_length. Skip MEA if this stride can't satisfy the kernel's
     // minimum alignment requirement.
     if (mea_eligible && attn_mask != nullptr) {
-      // NOTE: We use a fixed alignment of 4*sizeof(T) bytes, matching the contrib_ops
-      // MHA/GQA convention, instead of the per-SM kMinimumAlignment values from CUTLASS.
-      // The original ONNX Attention op applied the per-SM check incorrectly, which on
-      // some architectures rejected valid MEA candidates and fell back to the unfused
-      // path. A fixed conservative alignment avoids that class of bug entirely.
-      constexpr int min_bias_align = 4 * sizeof(T);
+      // NOTE: CUTLASS uses kMinimumAlignment = 4 (elements, not bytes) for the bias
+      // pointer in its epilogue. total_sequence_length is the bias row stride in elements,
+      // so we check alignment in element count. The contrib_ops convention (4 * sizeof(T))
+      // conflates bytes with elements; we use the correct value of 4 elements here.
+      constexpr int min_bias_align = 4;
       if (parameters.total_sequence_length % min_bias_align != 0) {
         mea_eligible = false;
       }

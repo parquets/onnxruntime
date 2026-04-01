@@ -35,7 +35,8 @@ __global__ void ConvertMaskToSeqlensKernel(
     const int64_t mask_dim0,
     const int64_t mask_dim1,
     const int64_t mask_dim2,
-    const int seqlen_offset) {
+    const int seqlen_offset,
+    const int max_seqlen) {
   int batch_idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (batch_idx >= batch_size) {
     return;
@@ -102,16 +103,16 @@ __global__ void ConvertMaskToSeqlensKernel(
     }
   }
 
-  // seqlens_k output: seq_len + seqlen_offset
-  // Decode with past (seqlen_offset=-kv_seq_len): pre-append cache count
-  // Prompt/MEA (seqlen_offset=0): actual token count
+  // seqlens_k output: min(max(0, seq_len + seqlen_offset), max_seqlen)
+  // Past seqlens (seqlen_offset=0, max_seqlen=past_seq): clamp leading trues to past length.
+  // seqlens_k for Flash (seqlen_offset=0, max_seqlen=INT_MAX): actual token count.
   // Clamp to 0: all-false mask (seq_len=0) with negative decode offset
   // would produce negative seqlens_k, which is undefined in Flash kernels.
-  seqlens_k[batch_idx] = max(0, seq_len + seqlen_offset);
+  seqlens_k[batch_idx] = min(max(0, seq_len + seqlen_offset), max_seqlen);
 }
 
-// Convert boolean mask to sequence lengths with a configurable offset.
-// seqlens_k[b] = num_true_tokens + seqlen_offset
+// Convert boolean mask to sequence lengths with a configurable offset and upper clamp.
+// seqlens_k[b] = min(max(0, num_true_tokens + seqlen_offset), max_seqlen)
 Status LaunchConvertMaskToFlashSeqlensK(
     const bool* attn_mask_bool,
     int* seqlens_k,
@@ -123,7 +124,8 @@ Status LaunchConvertMaskToFlashSeqlensK(
     int64_t mask_dim2,
     cudaStream_t stream,
     int max_threads_per_block,
-    int seqlen_offset) {
+    int seqlen_offset,
+    int max_seqlen) {
   if (batch_size == 0 || total_seq_len == 0) {
     return Status::OK();
   }
@@ -140,7 +142,8 @@ Status LaunchConvertMaskToFlashSeqlensK(
       mask_dim0,
       mask_dim1,
       mask_dim2,
-      seqlen_offset);
+      seqlen_offset,
+      max_seqlen);
 
   return CUDA_CALL(cudaGetLastError());
 }
